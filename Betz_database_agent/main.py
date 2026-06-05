@@ -23,17 +23,14 @@ def find_data_dir():
 
 
 DATA_DIR = find_data_dir()
+OVERRIDE_FILE = DATA_DIR / "quantity_overrides.csv"
 
 
 def find_excel_file():
     excel_files = list(DATA_DIR.glob("*.xlsx"))
 
     if not excel_files:
-        files_found = list(DATA_DIR.iterdir())
-        raise FileNotFoundError(
-            f"No .xlsx files found in {DATA_DIR}\n"
-            f"Files found: {files_found}"
-        )
+        raise FileNotFoundError(f"No .xlsx files found in {DATA_DIR}")
 
     if len(excel_files) > 1:
         print("Multiple Excel files found. Using the first one:")
@@ -53,36 +50,75 @@ def load_workbook():
 
 def get_master_list(sheets):
     if "masterList" not in sheets:
-        available_sheets = list(sheets.keys())
         raise KeyError(
-            f"'masterList' sheet was not found. Available sheets: {available_sheets}"
+            f"'masterList' was not found. Available sheets: {list(sheets.keys())}"
         )
 
     master = sheets["masterList"].copy()
 
+    master["ItemID"] = master["ItemID"].fillna("").astype(str)
     master["QtyOnHand"] = pd.to_numeric(master["QtyOnHand"], errors="coerce")
     master["MinQty"] = pd.to_numeric(master["MinQty"], errors="coerce")
+
+    return apply_quantity_overrides(master)
+
+
+def apply_quantity_overrides(master):
+    if not OVERRIDE_FILE.exists():
+        return master
+
+    overrides = pd.read_csv(OVERRIDE_FILE)
+    overrides["ItemID"] = overrides["ItemID"].astype(str)
+    overrides["QtyOnHand"] = pd.to_numeric(
+        overrides["QtyOnHand"],
+        errors="coerce",
+    )
+
+    override_quantities = overrides.set_index("ItemID")["QtyOnHand"]
+
+    master["QtyOnHand"] = master["ItemID"].map(
+        override_quantities
+    ).fillna(master["QtyOnHand"])
 
     return master
 
 
+def save_quantity_override(item_id, quantity):
+    if OVERRIDE_FILE.exists():
+        overrides = pd.read_csv(OVERRIDE_FILE)
+    else:
+        overrides = pd.DataFrame(columns=["ItemID", "QtyOnHand"])
+
+    overrides["ItemID"] = overrides["ItemID"].astype(str)
+
+    existing = overrides["ItemID"].str.lower() == item_id.lower()
+
+    if existing.any():
+        overrides.loc[existing, "QtyOnHand"] = quantity
+    else:
+        new_override = pd.DataFrame(
+            [{"ItemID": item_id, "QtyOnHand": quantity}]
+        )
+        overrides = pd.concat([overrides, new_override], ignore_index=True)
+
+    overrides.to_csv(OVERRIDE_FILE, index=False)
+
+
 def get_items_to_order(master):
-    items_to_order = master[
+    items = master[
         master["MinQty"].notna()
         & master["QtyOnHand"].notna()
         & (master["MinQty"] > 0)
         & (master["QtyOnHand"] < master["MinQty"])
     ].copy()
 
-    items_to_order["NeededQty"] = (
-        items_to_order["MinQty"] - items_to_order["QtyOnHand"]
-    )
+    items["NeededQty"] = items["MinQty"] - items["QtyOnHand"]
 
-    return items_to_order
+    return items
 
 
 def get_items_to_watch(master):
-    items_to_watch = master[
+    items = master[
         master["MinQty"].notna()
         & master["QtyOnHand"].notna()
         & (master["MinQty"] > 0)
@@ -90,11 +126,9 @@ def get_items_to_watch(master):
         & (master["QtyOnHand"] <= master["MinQty"] + 1)
     ].copy()
 
-    items_to_watch["QtyAboveMin"] = (
-        items_to_watch["QtyOnHand"] - items_to_watch["MinQty"]
-    )
+    items["QtyAboveMin"] = items["QtyOnHand"] - items["MinQty"]
 
-    return items_to_watch
+    return items
 
 
 def search_inventory(master, search_text):
@@ -108,30 +142,27 @@ def search_inventory(master, search_text):
         "Notes",
     ]
 
-    search_text = search_text.lower()
-
-    matches = master[
+    return master[
         master[searchable_columns]
         .fillna("")
         .astype(str)
         .apply(
-            lambda row: row.str.lower().str.contains(search_text, regex=False).any(),
+            lambda row: row.str.contains(
+                search_text,
+                case=False,
+                regex=False,
+            ).any(),
             axis=1,
         )
     ]
 
-    return matches
-
 
 def get_items_by_location(master, location):
-    location_text = location.lower()
-
     return master[
         master["Location"]
         .fillna("")
         .astype(str)
-        .str.lower()
-        .str.contains(location_text, regex=False)
+        .str.contains(location, case=False, regex=False)
     ].copy()
 
 
@@ -144,146 +175,159 @@ def get_quantity_by_category(master):
     )
 
 
-def print_table(df, columns):
-    if df.empty:
+def inventory_columns():
+    return [
+        "ItemID",
+        "Description",
+        "Category",
+        "QtyOnHand",
+        "Unit",
+        "Location",
+        "Owner/Truck",
+    ]
+
+
+def print_table(dataframe, columns):
+    if dataframe.empty:
         print("No matching items found.")
         return
 
-    print(df[columns].to_string(index=False))
+    print(dataframe[columns].to_string(index=False))
 
 
 def show_items_to_order(master):
-    items_to_order = get_items_to_order(master)
+    items = get_items_to_order(master)
 
-    print()
-    print("ITEMS TO ORDER")
+    print("\nITEMS TO ORDER")
 
-    if items_to_order.empty:
+    if items.empty:
         print("No items currently need to be ordered.")
         return
 
-    print(f"{len(items_to_order)} items are below minimum quantity.")
-    print()
+    print(f"{len(items)} items are below minimum quantity.\n")
 
-    columns = [
-        "ItemID",
-        "Description",
-        "Category",
-        "QtyOnHand",
-        "MinQty",
-        "NeededQty",
-        "Unit",
-        "Location",
-        "Owner/Truck",
-    ]
-
-    print_table(items_to_order, columns)
+    columns = inventory_columns() + ["MinQty", "NeededQty"]
+    print_table(items, columns)
 
 
 def show_items_to_watch(master):
-    items_to_watch = get_items_to_watch(master)
+    items = get_items_to_watch(master)
 
-    print()
-    print("ITEMS TO WATCH")
-    print("These items are at minimum quantity or only 1 above minimum quantity.")
+    print("\nITEMS TO WATCH")
+    print("Items at minimum or only 1 above minimum.\n")
 
-    if items_to_watch.empty:
-        print("No items are currently near minimum quantity.")
-        return
-
-    print(f"{len(items_to_watch)} items are near minimum quantity.")
-    print()
-
-    columns = [
-        "ItemID",
-        "Description",
-        "Category",
-        "QtyOnHand",
-        "MinQty",
-        "QtyAboveMin",
-        "Unit",
-        "Location",
-        "Owner/Truck",
-    ]
-
-    print_table(items_to_watch, columns)
+    columns = inventory_columns() + ["MinQty", "QtyAboveMin"]
+    print_table(items, columns)
 
 
 def show_search_results(master):
-    search_text = input("Search for item, category, location, or owner/truck: ").strip()
+    search_text = input("Enter item, category, location, or owner: ").strip()
 
     if not search_text:
-        print("Search cancelled. No search text entered.")
+        print("Search cancelled.")
         return
 
     matches = search_inventory(master, search_text)
 
-    print()
-    print(f"SEARCH RESULTS FOR: {search_text}")
-    print(f"{len(matches)} matching items found.")
-    print()
-
-    columns = [
-        "ItemID",
-        "Description",
-        "Category",
-        "QtyOnHand",
-        "Unit",
-        "Location",
-        "Owner/Truck",
-    ]
-
-    print_table(matches.head(25), columns)
+    print(f"\nSEARCH RESULTS FOR: {search_text}")
+    print(f"{len(matches)} matching items found.\n")
+    print_table(matches.head(25), inventory_columns())
 
 
 def show_location_results(master):
-    location = input("Enter location to search, like Shelf 1: ").strip()
+    location = input("Enter a location, such as Shelf 1: ").strip()
 
     if not location:
-        print("Location search cancelled. No location entered.")
+        print("Location search cancelled.")
         return
 
     matches = get_items_by_location(master, location)
 
-    print()
-    print(f"ITEMS IN LOCATION: {location}")
-    print(f"{len(matches)} matching items found.")
-    print()
-
-    columns = [
-        "ItemID",
-        "Description",
-        "Category",
-        "QtyOnHand",
-        "Unit",
-        "Location",
-        "Owner/Truck",
-    ]
-
-    print_table(matches.head(25), columns)
+    print(f"\nITEMS IN LOCATION: {location}")
+    print(f"{len(matches)} matching items found.\n")
+    print_table(matches.head(25), inventory_columns())
 
 
 def show_category_summary(master):
-    summary = get_quantity_by_category(master)
+    print("\nQUANTITY ON HAND BY CATEGORY\n")
+    print(get_quantity_by_category(master).to_string(index=False))
 
-    print()
-    print("QUANTITY ON HAND BY CATEGORY")
-    print()
-    print(summary.to_string(index=False))
+
+def manually_update_quantity(master):
+    search_text = input(
+        "Enter the ItemID or description of the item to update: "
+    ).strip()
+
+    if not search_text:
+        print("Update cancelled.")
+        return
+
+    matches = search_inventory(master, search_text)
+
+    if matches.empty:
+        print("No matching items found.")
+        return
+
+    print("\nMATCHING ITEMS\n")
+    print_table(matches.head(25), inventory_columns())
+
+    item_id = input("\nEnter the exact ItemID to update: ").strip()
+
+    item_match = master["ItemID"].str.lower() == item_id.lower()
+
+    if not item_match.any():
+        print(f"ItemID '{item_id}' was not found.")
+        return
+
+    item = master.loc[item_match].iloc[0]
+
+    print(
+        f"\nSelected: {item['ItemID']} - {item['Description']}"
+        f"\nCurrent quantity: {item['QtyOnHand']}"
+    )
+
+    quantity_text = input("Enter the new quantity: ").strip()
+
+    try:
+        new_quantity = float(quantity_text)
+    except ValueError:
+        print("Quantity must be a number.")
+        return
+
+    if new_quantity < 0:
+        print("Quantity cannot be negative.")
+        return
+
+    confirmation = input(
+        f"Change {item['ItemID']} quantity to {new_quantity}? (y/n): "
+    ).strip().lower()
+
+    if confirmation != "y":
+        print("Update cancelled.")
+        return
+
+    save_quantity_override(item["ItemID"], new_quantity)
+    master.loc[item_match, "QtyOnHand"] = new_quantity
+
+    print(f"Quantity updated to {new_quantity}.")
+    print(f"Override saved to: {OVERRIDE_FILE.name}")
 
 
 def show_menu():
-    print()
-    print("BETZ DATABASE AGENT")
+    print("\nBETZ DATABASE AGENT")
     print(f"Inventory file: {DATA_FILE.name}")
-    print()
-    print("What would you like to see?")
+
+    if OVERRIDE_FILE.exists():
+        print(f"Overrides file: {OVERRIDE_FILE.name}")
+
+    print("\nWhat would you like to see?")
     print("1. Items that need to be ordered")
     print("2. Items at or near minimum")
     print("3. Search inventory")
     print("4. Items by location")
     print("5. Quantity by category")
-    print("6. Exit")
+    print("6. Manually update an item quantity")
+    print("7. Exit")
 
 
 def run_menu(master):
@@ -302,10 +346,12 @@ def run_menu(master):
         elif choice == "5":
             show_category_summary(master)
         elif choice == "6":
+            manually_update_quantity(master)
+        elif choice == "7":
             print("Goodbye.")
             break
         else:
-            print("Please choose 1, 2, 3, 4, 5, or 6.")
+            print("Please choose an option from 1 through 7.")
 
 
 def main():
